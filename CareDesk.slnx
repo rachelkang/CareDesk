@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/CareDesk.Core/CareDesk.Core.csproj" />
+    <Project Path="src/CareDesk.Desktop/CareDesk.Desktop.csproj" />
+    <Project Path="src/CareDesk.Infrastructure/CareDesk.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/CareDesk.Tests/CareDesk.Tests.csproj" />
+  </Folder>
+</Solution>
