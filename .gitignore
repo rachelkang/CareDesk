@@ -1,0 +1,33 @@
+# This workspace also contains unrelated solutions. Track only CareDesk.
+/*
+!/.gitignore
+!/CareDesk.slnx
+!/global.json
+!/README.md
+!/.github/
+!/.github/**
+!/src/
+/src/*
+!/src/CareDesk.Core/
+!/src/CareDesk.Infrastructure/
+!/src/CareDesk.Desktop/
+!/tests/
+/tests/*
+!/tests/CareDesk.Tests/
+
+# Local build, IDE, test, database, and credential artifacts.
+**/bin/
+**/obj/
+**/.vs/
+**/TestResults/
+*.user
+*.suo
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+secrets.json
+*.pfx
+*.p12
+*.key
