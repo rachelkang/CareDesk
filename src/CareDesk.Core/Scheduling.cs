@@ -115,9 +115,7 @@ public sealed class SchedulingService(IAppointmentStore store, ClinicClock clock
     {
         var clinicians = SeedData.Clinicians;
         var clinicToday = DateOnly.FromDateTime(clock.ToLocal(timeProvider.GetUtcNow()));
-        var day = clinicToday.AddDays(1);
-        while (day.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) day = day.AddDays(1);
-        var appointments = SeedData.ForDay(day, clock);
+        var appointments = SeedData.ForDay(SeedData.DefaultScheduleDay(clinicToday), clock);
         await store.ResetAsync(clinicians, appointments, cancellationToken);
     }
 }
@@ -125,6 +123,13 @@ public sealed class SchedulingService(IAppointmentStore store, ClinicClock clock
 public static class SeedData
 {
     public const string ReschedulingMessage = "Hi! Could you move my appointment to 10:00 AM on the same day? I'd like to keep the same doctor. Thank you!";
+
+    public static DateOnly DefaultScheduleDay(DateOnly clinicDate)
+    {
+        var day = clinicDate.AddDays(1);
+        while (day.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) day = day.AddDays(1);
+        return day.AddDays(7);
+    }
 
     public static IReadOnlyList<Clinician> Clinicians { get; } =
     [

@@ -12,12 +12,53 @@ public sealed class SchedulingTests
     private static readonly DateTimeOffset Now = new(2026, 1, 1, 15, 0, 0, TimeSpan.Zero);
 
     [Fact]
+    public void Default_schedule_moves_all_sample_appointments_to_november_16()
+    {
+        var clinicDate = new DateOnly(2026, 11, 6);
+        var scheduleDay = SeedData.DefaultScheduleDay(clinicDate);
+        var appointments = SeedData.ForDay(scheduleDay, new ClinicClock(ClinicZone));
+
+        Assert.Equal(new DateOnly(2026, 11, 16), scheduleDay);
+        Assert.Equal(4, appointments.Count);
+        Assert.All(appointments, appointment => Assert.Equal(scheduleDay, DateOnly.FromDateTime(new ClinicClock(ClinicZone).ToLocal(appointment.StartUtc))));
+    }
+
+    [Fact]
+    public async Task Existing_november_ninth_appointments_move_to_november_sixteenth()
+    {
+        await WithStore(async (store, _, clock, path) =>
+        {
+            var previousAppointments = SeedData.ForDay(new DateOnly(2026, 11, 9), clock);
+            var expected = previousAppointments.ToDictionary(
+                appointment => appointment.Id,
+                appointment => (Start: clock.ToLocal(appointment.StartUtc).AddDays(7), End: clock.ToLocal(appointment.EndUtc).AddDays(7)));
+            await store.ResetAsync(SeedData.Clinicians, previousAppointments, default);
+            await using (var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={path}"))
+            {
+                await connection.OpenAsync();
+                var command = connection.CreateCommand();
+                command.CommandText = "PRAGMA user_version=5;";
+                await command.ExecuteNonQueryAsync();
+            }
+
+            await store.InitializeAsync(default);
+            var migrated = await store.GetAppointmentsAsync(default);
+            Assert.All(migrated, appointment =>
+            {
+                Assert.Equal(new DateOnly(2026, 11, 16), DateOnly.FromDateTime(clock.ToLocal(appointment.StartUtc)));
+                Assert.Equal(expected[appointment.Id].Start, clock.ToLocal(appointment.StartUtc));
+                Assert.Equal(expected[appointment.Id].End, clock.ToLocal(appointment.EndUtc));
+            });
+        });
+    }
+
+    [Fact]
     public async Task Reschedule_rejects_past_time_and_preserves_saved_appointment()
     {
         await WithStore(async (store, service, clock) =>
         {
             var current = (await store.GetAppointmentsAsync(default)).OrderBy(a => a.StartUtc).First();
-            var past = clock.ToLocal(current.StartUtc).AddDays(-1);
+            var past = clock.ToLocal(Now).AddMinutes(-1);
             var result = await service.RescheduleAsync(new(current.Id, current.ClinicianId, past, 30));
             Assert.False(result.Succeeded);
             Assert.Contains("future", result.Error, StringComparison.OrdinalIgnoreCase);
@@ -84,10 +125,11 @@ public sealed class SchedulingTests
             Assert.Equal(SeedData.ReschedulingMessage, current.PatientRequest);
             Assert.Null(saved.PatientRequest);
             await service.ResetAsync();
-            var reset = (await store.GetAppointmentsAsync(default)).Single(a => a.Id == current.Id);
+            var resetAppointments = await store.GetAppointmentsAsync(default);
+            Assert.All(resetAppointments, appointment => Assert.Equal(new DateOnly(2026, 1, 9), DateOnly.FromDateTime(clock.ToLocal(appointment.StartUtc))));
+            var reset = resetAppointments.Single(a => a.Id == current.Id);
             Assert.Equal(SeedData.ReschedulingMessage, reset.PatientRequest);
             Assert.Equal(new TimeOnly(9, 0), TimeOnly.FromDateTime(clock.ToLocal(reset.StartUtc)));
-            Assert.True(clock.ToLocal(reset.StartUtc) > Now.LocalDateTime);
         });
     }
 

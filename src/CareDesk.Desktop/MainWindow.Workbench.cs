@@ -165,7 +165,7 @@ public partial class MainWindow
 
         var detailsBorder = Card(); detailsBorder.Padding = new Thickness(15, 11, 15, 10); Grid.SetColumn(detailsBorder, 2); body.Children.Add(detailsBorder);
         var scroll = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled }; detailsBorder.Child = scroll;
-        var details = new StackPanel(); scroll.Content = details;
+        var details = new StackPanel { Margin = new Thickness(0, 0, 12, 0) }; scroll.Content = details;
         var detailTitle = new Grid(); detailTitle.ColumnDefinitions.Add(new ColumnDefinition()); detailTitle.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); var titleStack = new StackPanel(); titleStack.Children.Add(T("RESCHEDULE APPOINTMENT", 10, FontWeights.Bold, Purple)); titleStack.Children.Add(T("Review details", 20, FontWeights.SemiBold)); detailTitle.Children.Add(titleStack); var code = T("", 11, null, Muted); code.VerticalAlignment = VerticalAlignment.Center; code.SetBinding(TextBlock.TextProperty, new Binding("CurrentPatientCode")); Grid.SetColumn(code, 1); detailTitle.Children.Add(code); details.Children.Add(detailTitle);
         var summary = new Grid { Margin = new Thickness(0, 8, 0, 8), Background = Brush("#FBF9FC") }; summary.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.2, GridUnitType.Star) }); summary.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }); summary.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }); summary.Children.Add(SummaryCell("PATIENT", "CurrentPatient", 0)); summary.Children.Add(SummaryCell("CURRENT CLINICIAN", "CurrentClinician", 1)); summary.Children.Add(SummaryCell("CURRENT TIME", "CurrentInterval", 2)); details.Children.Add(new Border { Background = Brush("#FBF9FC"), BorderBrush = Line, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(6), Padding = new Thickness(9, 6, 9, 6), Child = summary });
         var requestBadge = new ContentControl { ContentTemplate = RequestBadgeTemplate() };
@@ -238,7 +238,7 @@ public partial class MainWindow
         var requestNote = T("Update applies and saves this suggestion. Update differently opens the manual appointment fields. Neither action records a patient reply.", 10, null, Muted);
         requestNote.TextWrapping = TextWrapping.Wrap;
         requestNote.Margin = new Thickness(0, 5, 0, 0);
-        requestNote.SetBinding(VisibilityProperty, new Binding("IsAppointmentSuggestionActive") { Converter = new BooleanVisibilityConverter() });
+        requestNote.SetBinding(VisibilityProperty, new Binding("ShowAppointmentSuggestionHelp") { Converter = new BooleanVisibilityConverter() });
         assistance.Children.Add(requestNote);
         var replySuggestion = new StackPanel();
         var replyTitle = T("", 11, FontWeights.Bold, Purple);

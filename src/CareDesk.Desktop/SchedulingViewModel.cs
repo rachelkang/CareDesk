@@ -52,6 +52,7 @@ public partial class SchedulingViewModel : ObservableObject
     private readonly Dictionary<AppointmentId, string> replyActionOutcomes = [];
     private bool suppressReplySuggestionRefresh;
     private bool isManualAppointmentEdit;
+    private SchedulingDraft? conflictingSuggestion;
 
     public SchedulingViewModel(SchedulingService scheduling, IAppointmentStore store, IReadOnlyList<ISchedulingDraftService> draftServices, ClinicClock clock, TimeProvider timeProvider, ILogger<SchedulingViewModel> logger)
         : this(scheduling, store, draftServices, clock, timeProvider, logger, null, null, null)
@@ -116,16 +117,19 @@ public partial class SchedulingViewModel : ObservableObject
     public string ReplyActionOutcome => selected is not null && replyActionOutcomes.TryGetValue(selected.Id, out var outcome) ? outcome : string.Empty;
     public bool IsAppointmentSuggestionActive => string.IsNullOrEmpty(AppointmentActionOutcome);
     public bool IsReplySuggestionActive => string.IsNullOrEmpty(ReplyActionOutcome);
-    public bool HasAppointmentSuggestion => !IsAppointmentSuggestionActive || !string.IsNullOrWhiteSpace(SuggestedAction);
+    public bool HasAppointmentSuggestion => conflictingSuggestion is null && (!IsAppointmentSuggestionActive || !string.IsNullOrWhiteSpace(SuggestedAction));
+    public bool ShowAppointmentSuggestionHelp => HasAppointmentSuggestion && IsAppointmentSuggestionActive;
     public bool HasReplySuggestion => !IsReplySuggestionActive || (linkedContext is not null && linkedContext.Request.Status != SchedulingWorkStatus.Completed && (IsPreparingReplySuggestion || !string.IsNullOrWhiteSpace(SuggestedReplyText) || !string.IsNullOrWhiteSpace(ReplySuggestionStatus)));
     public bool CanUseReplySuggestion => IsReplySuggestionActive && HasReplySuggestion && !IsPreparingReplySuggestion && !string.IsNullOrWhiteSpace(SuggestedReplyText) && linkedContext?.Request.OwnerId == workflow?.Staff.Current.Id && composer is not null;
-    public string ReplySuggestionTitle => linkedContext?.Request.Status == SchedulingWorkStatus.ReplyPending
+    public string ReplySuggestionTitle => conflictingSuggestion is not null
+        ? "Reply to patient about unavailable time"
+        : linkedContext?.Request.Status == SchedulingWorkStatus.ReplyPending
         ? "Reply to patient confirming new time"
         : "Reply to patient suggesting a different time";
     public string SuggestedReplyText { get => suggestedReplyText; private set { if (SetProperty(ref suggestedReplyText, value)) { OnPropertyChanged(nameof(HasReplySuggestion)); OnPropertyChanged(nameof(CanUseReplySuggestion)); } } }
     public string ReplySuggestionStatus { get => replySuggestionStatus; private set { if (SetProperty(ref replySuggestionStatus, value)) OnPropertyChanged(nameof(HasReplySuggestion)); } }
-    public bool CanApplySuggestion => IsAppointmentSuggestionActive && suggestion?.LocalStart is not null && string.IsNullOrWhiteSpace(suggestion.NeedsReview) && !IsPreparingSuggestion && !IsBusy;
-    public string SuggestedAction { get => suggestedAction; private set { if (SetProperty(ref suggestedAction, value)) OnPropertyChanged(nameof(HasAppointmentSuggestion)); } }
+    public bool CanApplySuggestion => conflictingSuggestion is null && IsAppointmentSuggestionActive && suggestion?.LocalStart is not null && string.IsNullOrWhiteSpace(suggestion.NeedsReview) && !IsPreparingSuggestion && !IsBusy;
+    public string SuggestedAction { get => suggestedAction; private set { if (SetProperty(ref suggestedAction, value)) { OnPropertyChanged(nameof(HasAppointmentSuggestion)); OnPropertyChanged(nameof(ShowAppointmentSuggestionHelp)); } } }
     public bool IsPreparingSuggestion { get => isPreparingSuggestion; private set { if (SetProperty(ref isPreparingSuggestion, value)) { OnPropertyChanged(nameof(CanApplySuggestion)); OnPropertyChanged(nameof(CanAcceptSuggestedUpdate)); } } }
     public bool IsPreparingReplySuggestion { get => isPreparingReplySuggestion; private set { if (SetProperty(ref isPreparingReplySuggestion, value)) { OnPropertyChanged(nameof(HasReplySuggestion)); OnPropertyChanged(nameof(CanUseReplySuggestion)); } } }
     public string EmptyMessage => Appointments.Count == 0 ? "No appointments are scheduled for this day." : "";
@@ -233,6 +237,7 @@ public partial class SchedulingViewModel : ObservableObject
         OnPropertyChanged(nameof(CanSaveChanges));
         OnPropertyChanged(nameof(CanAcceptSuggestedUpdate));
         OnPropertyChanged(nameof(HasAppointmentSuggestion));
+        OnPropertyChanged(nameof(ShowAppointmentSuggestionHelp));
         OnPropertyChanged(nameof(HasReplySuggestion));
         OnPropertyChanged(nameof(CanUseReplySuggestion));
         OnPropertyChanged(nameof(ReplySuggestionTitle));
@@ -346,10 +351,39 @@ public partial class SchedulingViewModel : ObservableObject
         draftCancellation?.Cancel();
         draftCancellation = null;
         suggestion = null;
+        conflictingSuggestion = null;
         SuggestedAction = string.Empty;
         IsPreparingSuggestion = false;
+        OnPropertyChanged(nameof(HasAppointmentSuggestion));
+        OnPropertyChanged(nameof(ShowAppointmentSuggestionHelp));
+        OnPropertyChanged(nameof(HasReplySuggestion));
+        OnPropertyChanged(nameof(ReplySuggestionTitle));
+        OnPropertyChanged(nameof(CanUseReplySuggestion));
         OnPropertyChanged(nameof(CanApplySuggestion));
         OnPropertyChanged(nameof(CanAcceptSuggestedUpdate));
+    }
+
+    private async Task<bool> HasBookingConflictAsync(Appointment appointment, SchedulingDraft draft, CancellationToken cancellationToken)
+    {
+        var start = clock.ToUtc(draft.LocalStart!.Value);
+        var end = start.AddMinutes(draft.DurationMinutes!.Value);
+        var appointments = await store.GetAppointmentsAsync(cancellationToken);
+        return appointments.Any(other => other.Id != appointment.Id && other.Status == "Scheduled" && other.ClinicianId == draft.ClinicianId && other.StartUtc < end && start < other.EndUtc);
+    }
+
+    private void RemoveConflictingRescheduleSuggestion(SchedulingDraft draft)
+    {
+        conflictingSuggestion = draft;
+        suggestion = null;
+        SuggestedAction = string.Empty;
+        replySuggestionCancellation?.Cancel();
+        replySuggestionCancellation = null;
+        IsPreparingReplySuggestion = false;
+        SuggestedReplyText = string.Empty;
+        ReplySuggestionStatus = string.Empty;
+        ErrorText = "The requested time conflicts with another booking. The current appointment has not been changed.";
+        NotifyWorkflowContext();
+        PrepareReplySuggestionCommand.Execute(null);
     }
 
     private void QueueReplySuggestionRefresh()
@@ -368,9 +402,19 @@ public partial class SchedulingViewModel : ObservableObject
         var context = linkedContext;
         if (appointment is null || context is null || string.IsNullOrWhiteSpace(PatientRequest) || replySuggestionServices.Count < 2)
         {
+            replySuggestionCancellation = null;
             SuggestedReplyText = string.Empty;
             ReplySuggestionStatus = string.Empty;
             IsPreparingReplySuggestion = false;
+            return;
+        }
+        if (conflictingSuggestion is { LocalStart: { } unavailableStart })
+        {
+            replySuggestionCancellation = null;
+            IsPreparingReplySuggestion = false;
+            var currentStart = clock.ToLocal(appointment.StartUtc);
+            SuggestedReplyText = $"The requested time on {unavailableStart:dddd, MMMM d, yyyy} at {unavailableStart:h:mm tt} is unavailable. Your current appointment on {currentStart:dddd, MMMM d, yyyy} at {currentStart:h:mm tt} with {appointment.ClinicianName} remains unchanged.";
+            ReplySuggestionStatus = "Scheduling availability · no AI call · current appointment unchanged";
             return;
         }
         using var pending = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -494,7 +538,16 @@ public partial class SchedulingViewModel : ObservableObject
                 DraftStatus = $"{draft.Source} · staff review needed";
                 return;
             }
-            suggestion = draft with { ClinicianId = clinician.Id, DurationMinutes = duration };
+            draft = draft with { ClinicianId = clinician.Id, DurationMinutes = duration };
+            var conflicts = await HasBookingConflictAsync(appointment, draft, pending.Token);
+            if (pending.IsCancellationRequested || draftCancellation != pending || selected?.Id != appointment.Id) return;
+            if (conflicts)
+            {
+                RemoveConflictingRescheduleSuggestion(draft);
+                DraftStatus = $"{draft.Source} · requested time unavailable";
+                return;
+            }
+            suggestion = draft;
             SuggestedAction = $"Reschedule to {start:dddd, MMMM d, yyyy} at {start:h:mm tt} with {clinician.DisplayName} ({duration} minutes).";
             DraftStatus = $"{draft.Source} · not saved";
             PrepareReplySuggestionCommand.Execute(null);
@@ -532,6 +585,20 @@ public partial class SchedulingViewModel : ObservableObject
     private async Task AcceptSuggestedUpdateAsync(CancellationToken cancellationToken)
     {
         if (!CanAcceptSuggestedUpdate) { ErrorText = "Wait for a complete appointment suggestion before updating."; return; }
+        var appointment = selected!;
+        var draft = suggestion!;
+        try
+        {
+            var conflicts = await HasBookingConflictAsync(appointment, draft, cancellationToken);
+            if (selected?.Id != appointment.Id || suggestion != draft || !CanAcceptSuggestedUpdate) return;
+            if (conflicts) { RemoveConflictingRescheduleSuggestion(draft); return; }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogError(ex, "Could not check requested time for appointment {AppointmentId}", appointment.Id);
+            if (selected?.Id == appointment.Id) ErrorText = "The requested time could not be checked. The current appointment has not been changed. Refresh the agenda and retry.";
+            return;
+        }
         IsManualAppointmentEdit = false;
         ApplySuggestion();
         await ConfirmRescheduleAsync(cancellationToken);

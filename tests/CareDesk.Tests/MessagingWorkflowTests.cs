@@ -12,6 +12,139 @@ public sealed class MessagingWorkflowTests
     private static readonly TimeZoneInfo ClinicZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
     private static readonly DateTimeOffset Now = new(2026, 1, 1, 15, 0, 0, TimeSpan.Zero);
 
+    [Theory]
+    [InlineData(10, 0, 30, true, "Scheduled", true)]
+    [InlineData(9, 45, 30, true, "Scheduled", true)]
+    [InlineData(10, 15, 30, true, "Scheduled", true)]
+    [InlineData(9, 45, 60, true, "Scheduled", true)]
+    [InlineData(9, 30, 30, true, "Scheduled", false)]
+    [InlineData(10, 30, 30, true, "Scheduled", false)]
+    [InlineData(10, 0, 30, false, "Scheduled", false)]
+    [InlineData(10, 0, 30, true, "Cancelled", false)]
+    public async Task Requested_time_conflicts_hide_reschedule_but_keep_accurate_reply_without_changing_booking(int hour, int minute, int duration, bool sameClinician, string status, bool conflicts)
+    {
+        await WithWorkflow(async context =>
+        {
+            var details = await ClaimMadsAsync(context.Workflow);
+            var appointment = details.Appointment!;
+            var blocker = (await context.Store.GetAppointmentsAsync(default)).Single(value => value.PatientName == "Anson Horton");
+            var clinician = SeedData.Clinicians.Single(value => value.Id == (sameClinician ? appointment.ClinicianId : SeedData.Clinicians[1].Id));
+            var start = context.Clock.ToUtc(context.Clock.ToLocal(appointment.StartUtc).Date.AddHours(hour).AddMinutes(minute));
+            await context.Store.SaveAsync(blocker with { StartUtc = start, EndUtc = start.AddMinutes(duration), ClinicianId = clinician.Id, ClinicianName = clinician.DisplayName, Status = status }, default);
+            await using (var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={context.Path}"))
+            {
+                await connection.OpenAsync();
+                var command = connection.CreateCommand();
+                command.CommandText = "UPDATE appointments SET status=$status WHERE id=$id";
+                command.Parameters.AddWithValue("$status", status);
+                command.Parameters.AddWithValue("$id", blocker.Id.Value.ToString("D"));
+                Assert.Equal(1, await command.ExecuteNonQueryAsync());
+            }
+            var before = await context.Store.GetAppointmentsAsync(default);
+            Assert.Equal(status, before.Single(value => value.Id == blocker.Id).Status);
+            var composer = new ReplyComposerViewModel(context.Workflow, context.TimeProvider, NullLogger<ReplyComposerViewModel>.Instance);
+            var schedule = new SchedulingViewModel(context.Scheduling, context.Store, [new SampleDraftService(), new SampleDraftService()], context.Clock, context.TimeProvider, NullLogger<SchedulingViewModel>.Instance, context.Workflow, composer, [new SampleReplySuggestionService(), new SampleReplySuggestionService()]);
+            await schedule.InitializeAsync(default);
+            Assert.True(await schedule.OpenAppointmentAsync(appointment.Id, details.Request.Id));
+            await schedule.PrepareDraftCommand.ExecuteAsync(null);
+            await schedule.PrepareReplySuggestionCommand.ExecuteAsync(null);
+
+            Assert.Equal(!conflicts, schedule.HasAppointmentSuggestion);
+            Assert.Equal(!conflicts, schedule.CanAcceptSuggestedUpdate);
+            Assert.True(schedule.HasReplySuggestion);
+            Assert.True(schedule.CanUseReplySuggestion);
+            Assert.False(schedule.IsDirty);
+            Assert.False(schedule.CanSaveChanges);
+            Assert.Equal(before, await context.Store.GetAppointmentsAsync(default));
+            if (conflicts)
+            {
+                Assert.Empty(schedule.SuggestedAction);
+                Assert.False(schedule.ShowAppointmentSuggestionHelp);
+                Assert.Contains("10:00 AM is unavailable", schedule.SuggestedReplyText);
+                Assert.Contains("9:00 AM", schedule.SuggestedReplyText);
+                Assert.Contains(appointment.ClinicianName, schedule.SuggestedReplyText);
+                Assert.Contains("remains unchanged", schedule.SuggestedReplyText);
+                Assert.DoesNotContain("We can offer", schedule.SuggestedReplyText);
+                Assert.Equal("Reply to patient about unavailable time", schedule.ReplySuggestionTitle);
+                await schedule.AcceptSuggestedUpdateCommand.ExecuteAsync(null);
+                await schedule.RecordSuggestedReplyCommand.ExecuteAsync(null);
+                var recorded = (await context.Workflow.GetConversationAsync(details.Conversation.Id))!;
+                Assert.Equal(appointment, recorded.Appointment);
+                Assert.Null(recorded.Request.OutcomeAppointmentRevision);
+                Assert.Equal(SchedulingWorkStatus.WaitingOnPatient, recorded.Request.Status);
+                var reply = Assert.Single(recorded.Messages, value => value.Direction == MessageDirection.Outgoing);
+                Assert.Contains("is unavailable", reply.Body);
+                Assert.Contains("remains unchanged", reply.Body);
+                Assert.Equal(before, await context.Store.GetAppointmentsAsync(default));
+            }
+            else
+            {
+                Assert.Contains("Reschedule to", schedule.SuggestedAction);
+                Assert.Contains("We can offer", schedule.SuggestedReplyText);
+                Assert.DoesNotContain("unavailable", schedule.SuggestedReplyText);
+            }
+        }, requestedTimeAvailable: false);
+    }
+
+    [Fact]
+    public async Task Conflict_reply_cannot_be_overwritten_by_a_delayed_available_time_reply()
+    {
+        await WithWorkflow(async context =>
+        {
+            var details = await ClaimMadsAsync(context.Workflow);
+            var replyService = new DelayedReplySuggestionService();
+            var composer = new ReplyComposerViewModel(context.Workflow, context.TimeProvider, NullLogger<ReplyComposerViewModel>.Instance);
+            var schedule = new SchedulingViewModel(context.Scheduling, context.Store, [new SampleDraftService(), new SampleDraftService()], context.Clock, context.TimeProvider, NullLogger<SchedulingViewModel>.Instance, context.Workflow, composer, [replyService, replyService]);
+            await schedule.InitializeAsync(default);
+            Assert.True(await schedule.OpenAppointmentAsync(details.Appointment!.Id, details.Request.Id));
+            await schedule.PrepareDraftCommand.ExecuteAsync(null);
+            replyService.DelayNext = true;
+            var pending = schedule.PrepareReplySuggestionCommand.ExecuteAsync(null);
+            await replyService.Started.Task;
+            var blocker = (await context.Store.GetAppointmentsAsync(default)).Single(value => value.PatientName == "Anson Horton");
+            var start = details.Appointment.StartUtc.AddHours(1);
+            await context.Store.SaveAsync(blocker with { StartUtc = start, EndUtc = start.AddMinutes(30) }, default);
+            await schedule.PrepareDraftCommand.ExecuteAsync(null);
+            replyService.Release.SetResult(ReplySuggestionResult.Success("We can offer the requested time.", "Delayed reply"));
+            await pending;
+
+            Assert.False(schedule.HasAppointmentSuggestion);
+            Assert.True(schedule.HasReplySuggestion);
+            Assert.Contains("is unavailable", schedule.SuggestedReplyText);
+            Assert.Contains("remains unchanged", schedule.SuggestedReplyText);
+            Assert.DoesNotContain("We can offer", schedule.SuggestedReplyText);
+            Assert.Equal(details.Appointment, (await context.Workflow.GetConversationAsync(details.Conversation.Id))!.Appointment);
+        });
+    }
+
+    [Fact]
+    public async Task Newly_conflicting_suggested_update_is_not_applied_or_saved()
+    {
+        await WithWorkflow(async context =>
+        {
+            var details = await ClaimMadsAsync(context.Workflow);
+            var schedule = new SchedulingViewModel(context.Scheduling, context.Store, [new SampleDraftService(), new SampleDraftService()], context.Clock, context.TimeProvider, NullLogger<SchedulingViewModel>.Instance, context.Workflow, null, [new SampleReplySuggestionService(), new SampleReplySuggestionService()]);
+            await schedule.InitializeAsync(default);
+            Assert.True(await schedule.OpenAppointmentAsync(details.Appointment!.Id, details.Request.Id));
+            await schedule.PrepareDraftCommand.ExecuteAsync(null);
+            Assert.True(schedule.CanAcceptSuggestedUpdate);
+            var blocker = (await context.Store.GetAppointmentsAsync(default)).Single(value => value.PatientName == "Anson Horton");
+            var start = details.Appointment.StartUtc.AddHours(1);
+            await context.Store.SaveAsync(blocker with { StartUtc = start, EndUtc = start.AddMinutes(30) }, default);
+
+            await schedule.AcceptSuggestedUpdateCommand.ExecuteAsync(null);
+
+            Assert.False(schedule.HasAppointmentSuggestion);
+            Assert.False(schedule.CanAcceptSuggestedUpdate);
+            Assert.False(schedule.IsDirty);
+            Assert.Contains("is unavailable", schedule.SuggestedReplyText);
+            var unchanged = (await context.Workflow.GetConversationAsync(details.Conversation.Id))!;
+            Assert.Equal(details.Appointment, unchanged.Appointment);
+            Assert.Equal(details.Request, unchanged.Request);
+            Assert.Empty(unchanged.Messages.Where(value => value.Direction == MessageDirection.Outgoing));
+        });
+    }
+
     [Fact]
     public async Task Conversation_request_and_appointment_link_by_id_and_reject_unrelated_context()
     {
@@ -828,7 +961,7 @@ public sealed class MessagingWorkflowTests
     private static MessagingWorkflowService CreateWorkflow(IWorkflowStore store, SchedulingService scheduling, ClinicClock clock, TimeProvider timeProvider, StaffMember current) =>
         new(store, scheduling, clock, timeProvider, new StaffContext(current, MessagingSeedData.Staff));
 
-    private static async Task WithWorkflow(Func<TestContext, Task> action)
+    private static async Task WithWorkflow(Func<TestContext, Task> action, bool requestedTimeAvailable = true)
     {
         var folder = Path.Combine(Path.GetTempPath(), "CareDesk.Workflow.Tests", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(folder);
@@ -839,6 +972,11 @@ public sealed class MessagingWorkflowTests
         try
         {
             await store.InitializeAsync(default);
+            if (requestedTimeAvailable)
+            {
+                var blocker = (await store.GetAppointmentsAsync(default)).Single(value => value.PatientName == "Anson Horton");
+                await store.SaveAsync(blocker with { StartUtc = blocker.StartUtc.AddHours(4), EndUtc = blocker.EndUtc.AddHours(4) }, default);
+            }
             var scheduling = new SchedulingService(store, clock, timeProvider);
             var workflow = CreateWorkflow(store, scheduling, clock, timeProvider, MessagingSeedData.CurrentStaff);
             await action(new(store, scheduling, workflow, clock, timeProvider, path));

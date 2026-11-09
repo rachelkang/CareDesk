@@ -134,14 +134,51 @@ public sealed partial class SqliteAppointmentStore(string databasePath, ClinicCl
             await migration.ExecuteNonQueryAsync(cancellationToken);
             await transaction.CommitAsync(cancellationToken);
         }
+        if (currentVersion < 6)
+        {
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var previousScheduleDay = new DateOnly(2026, 11, 9);
+            var query = connection.CreateCommand();
+            query.Transaction = transaction;
+            query.CommandText = "SELECT id, start_utc, end_utc FROM appointments";
+            var appointmentsToMove = new List<(string Id, DateTimeOffset Start, DateTimeOffset End)>();
+            await using (var reader = await query.ExecuteReaderAsync(cancellationToken))
+            {
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    var start = DateTimeOffset.Parse(reader.GetString(1), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+                    if (DateOnly.FromDateTime(clock.ToLocal(start)) != previousScheduleDay) continue;
+                    var end = DateTimeOffset.Parse(reader.GetString(2), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+                    appointmentsToMove.Add((reader.GetString(0), start, end));
+                }
+            }
+            foreach (var appointment in appointmentsToMove)
+            {
+                var localStart = clock.ToLocal(appointment.Start).AddDays(7);
+                var localEnd = clock.ToLocal(appointment.End).AddDays(7);
+                var start = clock.ToUtc(localStart).ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
+                var end = clock.ToUtc(localEnd).ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
+                var update = connection.CreateCommand();
+                update.Transaction = transaction;
+                update.CommandText = "UPDATE appointments SET start_utc=$start, end_utc=$end WHERE id=$id; UPDATE reply_drafts SET appointment_start_utc=$start WHERE appointment_start_utc=$previousStart AND request_id IN (SELECT id FROM scheduling_requests WHERE appointment_id=$id);";
+                update.Parameters.AddWithValue("$id", appointment.Id);
+                update.Parameters.AddWithValue("$start", start);
+                update.Parameters.AddWithValue("$end", end);
+                update.Parameters.AddWithValue("$previousStart", appointment.Start.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture));
+                await update.ExecuteNonQueryAsync(cancellationToken);
+            }
+            var migration = connection.CreateCommand();
+            migration.Transaction = transaction;
+            migration.CommandText = "PRAGMA user_version=6";
+            await migration.ExecuteNonQueryAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+        }
         var count = connection.CreateCommand();
         count.CommandText = "SELECT COUNT(*) FROM appointments";
         if (Convert.ToInt64(await count.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture) == 0)
         {
             var clinicDate = DateOnly.FromDateTime(clock.ToLocal(timeProvider.GetUtcNow()));
-            var seedDate = clinicDate.AddDays(1);
-            while (seedDate.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) seedDate = seedDate.AddDays(1);
-            await ResetAsync(SeedData.Clinicians, SeedData.ForDay(seedDate, clock), cancellationToken);
+            await ResetAsync(SeedData.Clinicians, SeedData.ForDay(SeedData.DefaultScheduleDay(clinicDate), clock), cancellationToken);
         }
         else
         {
